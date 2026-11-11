@@ -1,6 +1,7 @@
 /*
 Hello it is GiraffezAreCool. This is my attempt to make PvZ in rust and Vulkan
 This is mt first time using rust and vulkan so please help
+Why am i doing this you may ask? cause i'd be fun idk.
 
 NO GEN AI
 uhhh yea
