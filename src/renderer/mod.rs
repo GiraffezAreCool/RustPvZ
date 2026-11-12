@@ -7,6 +7,7 @@ use ash::khr::swapchain;
 use ash::vk;
 use std::collections::HashMap;
 use std::ffi;
+use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::HasDisplayHandle;
@@ -73,7 +74,6 @@ impl VulkanRenderer {
         Ok(instance)
     }
 
-    //Gets first physical device if no discrete GPU
     fn get_physical_device(
         instance: &ash::Instance,
         entry: &ash::Entry,
@@ -336,15 +336,17 @@ struct RendererSwapchain {
     image_views: Vec<vk::ImageView>,
     format: vk::Format,
     extent: vk::Extent2D,
+    logical_device: Arc<LogicalDevice>,
 }
 
 impl RendererSwapchain {
     fn new(
         instance: &ash::Instance,
-        logical_device: &LogicalDevice,
+        logical_device: LogicalDevice,
         //physical_device: &PhysicalDevice,
         window: &RendererWindow,
     ) -> Result<Self> {
+        println!("Making Swapchain");
         let format = vk::Format::B8G8R8A8_SRGB;
         let extent = window.capabilities.current_extent;
 
@@ -372,14 +374,92 @@ impl RendererSwapchain {
             )?
         };
 
-        //TODO: finish swapchain
+        let images = unsafe { swapchain_instance.get_swapchain_images(swapchain)? };
+
+        let mut image_views: Vec<vk::ImageView> = Vec::with_capacity(images.len());
+
+        for image in images {
+            let subresource_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            let image_view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .subresource_range(subresource_range);
+
+            let image_view = unsafe {
+                logical_device
+                    .handle
+                    .create_image_view(&image_view_info, None)?
+            };
+
+            image_views.push(image_view);
+        }
 
         Ok(Self {
             swapchain_instance,
             swapchain,
-            image_views: vec![],
+            image_views,
             format,
             extent,
+            logical_device: Arc::new(logical_device),
         })
     }
 }
+
+impl Drop for RendererSwapchain {
+    fn drop(&mut self) {
+        for image_view in &self.image_views {
+            unsafe {
+                self.logical_device
+                    .handle
+                    .destroy_image_view(*image_view, None)
+            };
+        }
+        unsafe {
+            self.swapchain_instance
+                .destroy_swapchain(self.swapchain, None)
+        };
+    }
+}
+
+struct Shader {
+    shader_module: vk::ShaderModule,
+    stage: vk::ShaderStageFlags,
+    device: Arc<LogicalDevice>,
+}
+
+impl Shader {
+    fn new(device: LogicalDevice, code: &[u32], stage: vk::ShaderStageFlags) -> Result<Self> {
+        let shader_module_info = vk::ShaderModuleCreateInfo::default().code(code);
+
+        let shader_module = unsafe {
+            device
+                .handle
+                .create_shader_module(&shader_module_info, None)?
+        };
+
+        Ok(Shader {
+            shader_module,
+            stage,
+            device: Arc::new(device),
+        })
+    }
+}
+
+impl Drop for Shader {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .handle
+                .destroy_shader_module(self.shader_module, None)
+        };
+    }
+}
+
+struct RendererPipeline {}
