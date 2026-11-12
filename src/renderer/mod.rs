@@ -34,10 +34,11 @@ struct VulkanRenderer {
 }
 
 impl VulkanRenderer {
-    fn new() -> Self {
+    fn new(window: &Window) -> Self {
+        println!("Making VulkanRenderer");
         let entry = unsafe { ash::Entry::load().unwrap() };
-        let instance = Self::create_instance(&entry).unwrap();
-        let physical_device = Self::get_physical_device(&instance).unwrap();
+        let instance = Self::create_instance(&entry, &window).unwrap();
+        let physical_device = Self::get_physical_device(&instance, &entry, &window).unwrap();
         let logical_device =
             Self::create_logical_device(&instance, physical_device.clone()).unwrap();
         Self {
@@ -48,7 +49,7 @@ impl VulkanRenderer {
         }
     }
 
-    fn create_instance(entry: &ash::Entry) -> Result<ash::Instance> {
+    fn create_instance(entry: &ash::Entry, window: &Window) -> Result<ash::Instance> {
         let app_name = ffi::CString::new("PvZ Rust").unwrap();
         let engine_name = ffi::CString::new("Vulkan Engine").unwrap();
 
@@ -59,7 +60,13 @@ impl VulkanRenderer {
             .engine_version(vk::make_api_version(0, 1, 0, 0))
             .api_version(vk::API_VERSION_1_3);
 
-        let info = vk::InstanceCreateInfo::default().application_info(&app_info);
+        let raw_display_handle = window.display_handle()?.as_raw();
+
+        let info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(ash_window::enumerate_required_extensions(
+                raw_display_handle,
+            )?);
 
         let instance = unsafe { entry.create_instance(&info, None)? };
 
@@ -67,14 +74,41 @@ impl VulkanRenderer {
     }
 
     //Gets first physical device if no discrete GPU
-    fn get_physical_device(instance: &ash::Instance) -> Result<PhysicalDevice> {
-        let physical_devices = unsafe { instance.enumerate_physical_devices()? };
+    fn get_physical_device(
+        instance: &ash::Instance,
+        entry: &ash::Entry,
+        window: &Window,
+    ) -> Result<PhysicalDevice> {
+        let mut physical_devices = unsafe { instance.enumerate_physical_devices()? };
+
+        let raw_display_handle = window.display_handle()?.as_raw();
+        let raw_window_handle = window.window_handle()?.as_raw();
+
+        let surface_extention = ash::khr::surface::Instance::new(&entry, &instance);
+
+        let compatibility_surface = unsafe {
+            ash_window::create_surface(
+                &entry,
+                &instance,
+                raw_display_handle,
+                raw_window_handle,
+                None,
+            )?
+        };
+        unsafe {
+            physical_devices.retain(|device| {
+                surface_extention
+                    .get_physical_device_surface_support(*device, 0, compatibility_surface)
+                    .unwrap_or(false)
+            })
+        };
+
+        unsafe { surface_extention.destroy_surface(compatibility_surface, None) };
 
         let mut handle = physical_devices[0];
 
         for physical_device in physical_devices {
             let prop = unsafe { instance.get_physical_device_properties(physical_device) };
-
             if prop.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
                 handle = physical_device;
                 break;
@@ -152,6 +186,7 @@ impl VulkanRenderer {
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         unsafe {
+            self.logical_device.handle.destroy_device(None);
             self.instance.destroy_instance(None);
         }
     }
@@ -164,11 +199,11 @@ struct RendererWindow {
     capabilities: vk::SurfaceCapabilitiesKHR,
 }
 
-impl Drop for RendererWindow {
-    fn drop(&mut self) {
-        unsafe { self.surface_instance.destroy_surface(self.surface, None) };
-    }
-}
+//impl Drop for RendererWindow {
+//    fn drop(&mut self) {
+//        unsafe { self.surface_instance.destroy_surface(self.surface, None) };
+//    }
+//}
 
 pub struct Engine {
     renderer: VulkanRenderer,
@@ -178,12 +213,13 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
+        println!("Making Engine");
         let primary_window = event_loop.create_window(Default::default())?;
         let primary_window_id = primary_window.id();
 
         primary_window.set_title("PvZ Rust");
 
-        let renderer = VulkanRenderer::new();
+        let renderer = VulkanRenderer::new(&primary_window);
 
         let raw_display_handle = primary_window.display_handle()?.as_raw();
         let raw_window_handle = primary_window.window_handle()?.as_raw();
@@ -215,7 +251,6 @@ impl Engine {
         };
 
         let windows = HashMap::from([(primary_window_id, renderer_window)]);
-
         Ok(Self {
             renderer,
             windows,
@@ -283,6 +318,18 @@ impl Engine {
     }
 }
 
+impl Drop for Engine {
+    fn drop(&mut self) {
+        for (window_id, renderer_window) in &mut self.windows {
+            unsafe {
+                renderer_window
+                    .surface_instance
+                    .destroy_surface(renderer_window.surface, None)
+            };
+        }
+    }
+}
+
 struct RendererSwapchain {
     swapchain_instance: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
@@ -330,7 +377,7 @@ impl RendererSwapchain {
         Ok(Self {
             swapchain_instance,
             swapchain,
-            image_views,
+            image_views: vec![],
             format,
             extent,
         })

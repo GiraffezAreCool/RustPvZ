@@ -34,6 +34,8 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     let mut app = App::default();
 
     let event_loop = winit::event_loop::EventLoop::new().unwrap();
