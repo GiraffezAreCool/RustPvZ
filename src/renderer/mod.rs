@@ -126,8 +126,8 @@ impl VulkanRenderer {
         self.graphics_pipeline.clean_up(&self.logical_device);
         unsafe {
             self.logical_device.handle.destroy_device(None);
-            self.instance.destroy_instance(None);
         }
+        println!("Destroyed logical device");
     }
 }
 
@@ -340,18 +340,21 @@ impl Engine {
     }
 }
 
-//impl Drop for Engine {
-//    fn drop(&mut self) {
-//        for (window_id, renderer_window) in &mut self.windows {
-//            unsafe {
-//                renderer_window
-//                    .surface_instance
-//                    .destroy_surface(renderer_window.surface, None)
-//            };
-//        }
-//        self.renderer.clean_up();
-//    }
-//}
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.renderer.clean_up();
+        for (window_id, renderer_window) in &mut self.windows {
+            unsafe {
+                renderer_window
+                    .surface_instance
+                    .destroy_surface(renderer_window.surface, None)
+            };
+        }
+        println!("Destroyed surfaces");
+        unsafe { self.renderer.instance.destroy_instance(None) };
+        println!("Destroyed instace");
+    }
+}
 
 struct RendererSwapchain {
     swapchain_instance: khr::swapchain::Device,
@@ -436,10 +439,12 @@ impl RendererSwapchain {
         for image_view in &self.image_views {
             unsafe { logical_device.handle.destroy_image_view(*image_view, None) };
         }
+        println!("Destroyed image views");
         unsafe {
             self.swapchain_instance
                 .destroy_swapchain(self.swapchain, None)
         };
+        println!("Destroyed swapchain");
     }
 }
 
@@ -474,6 +479,7 @@ impl Shader {
                 .handle
                 .destroy_shader_module(self.shader_module, None)
         };
+        println!("Destroyed shader module");
     }
 }
 
@@ -487,10 +493,19 @@ impl Shader {
 //    }
 //}
 
+struct Frame {
+    command_buffer: vk::CommandBuffer,
+    image_available_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    fence: vk::Fence,
+}
+
 struct RendererPipeline {
-    pipeline_layout: PipelineLayout,
     pipeline: vk::Pipeline,
+    pipeline_layout: PipelineLayout,
     swapchain: RendererSwapchain,
+    command_pool: vk::CommandPool,
+    frames: Vec<Frame>,
 }
 
 impl RendererPipeline {
@@ -499,7 +514,7 @@ impl RendererPipeline {
         window: &RendererWindow,
         instance: &ash::Instance,
     ) -> Result<Self> {
-        let mut swapchain = RendererSwapchain::new(instance, &logical_device, window)?;
+        let swapchain = RendererSwapchain::new(instance, &logical_device, window)?;
         println!("Making RendererPipeline");
 
         let mut vertex_code = io::Cursor::new(std::fs::read("src/shaders/vert.spv")?);
@@ -531,17 +546,63 @@ impl RendererPipeline {
             Default::default(),
         )?;
 
-        let renderer_pipeline = Self {
-            pipeline_layout,
-            pipeline,
-            swapchain,
-        };
-
         vert_shader.clean_up(logical_device);
         frag_shader.clean_up(logical_device);
 
-        Ok(renderer_pipeline)
+        let command_pool = unsafe {
+            logical_device.handle.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(logical_device.graphics_queue_idx)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )?
+        };
+
+        let command_buffer_count = 1;
+
+        let command_buffers = unsafe {
+            logical_device.handle.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(command_buffer_count),
+            )?
+        };
+
+        let mut frames = Vec::with_capacity(command_buffers.len());
+
+        for &command_buffer in command_buffers.iter() {
+            unsafe {
+                let image_available_semaphore = logical_device
+                    .handle
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                let render_finished_semaphore = logical_device
+                    .handle
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                let fence = logical_device.handle.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )?;
+
+                frames.push(Frame {
+                    command_buffer,
+                    image_available_semaphore,
+                    render_finished_semaphore,
+                    fence,
+                });
+            }
+        }
+
+        Ok(Self {
+            pipeline_layout,
+            pipeline,
+            swapchain,
+            command_pool,
+            frames,
+        })
     }
+
+    fn render(&mut self) {}
 
     fn create_graphics_pipeline(
         logical_device: &LogicalDevice,
@@ -624,10 +685,29 @@ impl RendererPipeline {
 
     fn clean_up(&mut self, logical_device: &LogicalDevice) {
         unsafe {
+            self.frames.drain(..).for_each(|frame| {
+                logical_device
+                    .handle
+                    .destroy_semaphore(frame.image_available_semaphore, None);
+                logical_device
+                    .handle
+                    .destroy_semaphore(frame.render_finished_semaphore, None);
+                logical_device.handle.destroy_fence(frame.fence, None);
+                logical_device
+                    .handle
+                    .free_command_buffers(self.command_pool, &[frame.command_buffer]);
+            });
+            println!("Destroyed frames");
+            logical_device
+                .handle
+                .destroy_command_pool(self.command_pool, None);
+            println!("Destroyed commandPool");
             logical_device.handle.destroy_pipeline(self.pipeline, None);
+            println!("Destroyed pipeline");
             logical_device
                 .handle
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            println!("Destroyed pipeline layout");
         }
         self.swapchain.clean_up(logical_device);
     }
