@@ -1,3 +1,7 @@
+/*
+in what order am i supposed to destroy stuff??????
+*/
+
 use anyhow::Ok;
 use anyhow::Result;
 use anyhow::bail;
@@ -5,8 +9,10 @@ use ash::Entry;
 use ash::khr;
 use ash::khr::swapchain;
 use ash::vk;
+use ash::vk::PipelineLayout;
 use std::collections::HashMap;
 use std::ffi;
+use std::io;
 use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -32,22 +38,176 @@ struct VulkanRenderer {
     instance: ash::Instance,
     physical_device: PhysicalDevice,
     logical_device: LogicalDevice,
+    graphics_pipeline: RendererPipeline,
 }
 
 impl VulkanRenderer {
-    fn new(window: &Window) -> Self {
+    fn new(
+        window: &RendererWindow,
+        instance: ash::Instance,
+        entry: ash::Entry,
+        physical_device: PhysicalDevice,
+    ) -> Self {
         println!("Making VulkanRenderer");
-        let entry = unsafe { ash::Entry::load().unwrap() };
-        let instance = Self::create_instance(&entry, &window).unwrap();
-        let physical_device = Self::get_physical_device(&instance, &entry, &window).unwrap();
-        let logical_device =
-            Self::create_logical_device(&instance, physical_device.clone()).unwrap();
+        let logical_device = Self::create_logical_device(&instance, physical_device).unwrap();
+        let graphics_pipeline = RendererPipeline::new(&logical_device, &window, &instance).unwrap();
         Self {
             entry,
             instance,
             physical_device,
             logical_device,
+            graphics_pipeline,
         }
+    }
+
+    fn create_logical_device(
+        instance: &ash::Instance,
+        physical_device: PhysicalDevice,
+    ) -> Result<LogicalDevice> {
+        let queue_family_prop =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device.handle) };
+
+        let mut idx = None;
+
+        for (i, queue_family) in queue_family_prop.iter().enumerate() {
+            if queue_family.queue_count <= 0 {
+                continue;
+            }
+
+            if queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                idx = Some(i as u32);
+                break;
+            }
+        }
+
+        let graphics_queue_idx = match idx {
+            None => bail!("No graphics queue found"),
+            Some(i) => i,
+        };
+
+        let queue_info = vec![
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(graphics_queue_idx)
+                .queue_priorities(&[1.0]),
+        ];
+
+        let handle = unsafe {
+            instance.create_device(
+                physical_device.handle,
+                &vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queue_info)
+                    .enabled_extension_names(&[ash::khr::swapchain::NAME.as_ptr()])
+                    .push_next(
+                        &mut vk::PhysicalDeviceDynamicRenderingFeatures::default()
+                            .dynamic_rendering(true),
+                    )
+                    .push_next(
+                        &mut vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
+                            .buffer_device_address(true),
+                    )
+                    .push_next(
+                        &mut vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default()
+                            .dynamic_rendering_local_read(true),
+                    ),
+                None,
+            )?
+        };
+
+        let graphics_queue = unsafe { handle.get_device_queue(graphics_queue_idx, 0) };
+
+        Ok(LogicalDevice {
+            handle,
+            graphics_queue,
+            graphics_queue_idx,
+        })
+    }
+
+    fn clean_up(&mut self) {
+        self.graphics_pipeline.clean_up(&self.logical_device);
+        unsafe {
+            self.logical_device.handle.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+//impl Drop for VulkanRenderer {
+//    fn drop(&mut self) {
+//        self.graphics_pipeline.clean_up(&self.logical_device);
+//        unsafe {
+//            self.logical_device.handle.destroy_device(None);
+//            self.instance.destroy_instance(None);
+//        }
+//    }
+//}
+
+struct RendererWindow {
+    window: Window,
+    surface: vk::SurfaceKHR,
+    surface_instance: ash::khr::surface::Instance,
+    capabilities: vk::SurfaceCapabilitiesKHR,
+}
+
+//impl Drop for RendererWindow {
+//    fn drop(&mut self) {
+//        unsafe { self.surface_instance.destroy_surface(self.surface, None) };
+//    }
+//}
+
+pub struct Engine {
+    renderer: VulkanRenderer,
+    windows: HashMap<WindowId, RendererWindow>,
+    primary_window_id: WindowId,
+}
+
+impl Engine {
+    pub fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
+        println!("Making Engine");
+        let primary_window = event_loop.create_window(Default::default())?;
+        let primary_window_id = primary_window.id();
+
+        primary_window.set_title("PvZ Rust");
+
+        let entry = unsafe { ash::Entry::load().unwrap() };
+        let instance = Self::create_instance(&entry, &primary_window).unwrap();
+        let physical_device =
+            Self::get_physical_device(&instance, &entry, &primary_window).unwrap();
+
+        let raw_display_handle = primary_window.display_handle()?.as_raw();
+        let raw_window_handle = primary_window.window_handle()?.as_raw();
+
+        let surface = unsafe {
+            ash_window::create_surface(
+                &entry,
+                &instance,
+                raw_display_handle,
+                raw_window_handle,
+                None,
+            )?
+        };
+
+        let surface_instance = khr::surface::Instance::new(&entry, &instance);
+
+        let capabilities = unsafe {
+            surface_instance
+                .get_physical_device_surface_capabilities(physical_device.handle, surface)?
+        };
+
+        let renderer_window = RendererWindow {
+            window: primary_window,
+            surface,
+            surface_instance,
+            capabilities,
+        };
+
+        let renderer = VulkanRenderer::new(&renderer_window, instance, entry, physical_device);
+
+        let windows = HashMap::from([(primary_window_id, renderer_window)]);
+        Ok(Self {
+            renderer,
+            windows,
+            primary_window_id,
+        })
     }
 
     fn create_instance(entry: &ash::Entry, window: &Window) -> Result<ash::Instance> {
@@ -120,144 +280,6 @@ impl VulkanRenderer {
         Ok(PhysicalDevice { handle, properties })
     }
 
-    fn create_logical_device(
-        instance: &ash::Instance,
-        physical_device: PhysicalDevice,
-    ) -> Result<LogicalDevice> {
-        let queue_family_prop =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device.handle) };
-
-        let mut idx = None;
-
-        for (i, queue_family) in queue_family_prop.iter().enumerate() {
-            if queue_family.queue_count <= 0 {
-                continue;
-            }
-
-            if queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                idx = Some(i as u32);
-                break;
-            }
-        }
-
-        let graphics_queue_idx = match idx {
-            None => bail!("No graphics queue found"),
-            Some(i) => i,
-        };
-
-        let queue_info = vec![
-            vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(graphics_queue_idx)
-                .queue_priorities(&[1.0]),
-        ];
-
-        let handle = unsafe {
-            instance.create_device(
-                physical_device.handle,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queue_info)
-                    .enabled_extension_names(&[ash::khr::swapchain::NAME.as_ptr()])
-                    .push_next(
-                        &mut vk::PhysicalDeviceDynamicRenderingFeatures::default()
-                            .dynamic_rendering(true),
-                    )
-                    .push_next(
-                        &mut vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
-                            .buffer_device_address(true),
-                    )
-                    .push_next(
-                        &mut vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default()
-                            .dynamic_rendering_local_read(true),
-                    ),
-                None,
-            )?
-        };
-
-        let graphics_queue = unsafe { handle.get_device_queue(graphics_queue_idx, 0) };
-
-        Ok(LogicalDevice {
-            handle,
-            graphics_queue,
-            graphics_queue_idx,
-        })
-    }
-}
-
-impl Drop for VulkanRenderer {
-    fn drop(&mut self) {
-        unsafe {
-            self.logical_device.handle.destroy_device(None);
-            self.instance.destroy_instance(None);
-        }
-    }
-}
-
-struct RendererWindow {
-    window: Window,
-    surface: vk::SurfaceKHR,
-    surface_instance: ash::khr::surface::Instance,
-    capabilities: vk::SurfaceCapabilitiesKHR,
-}
-
-//impl Drop for RendererWindow {
-//    fn drop(&mut self) {
-//        unsafe { self.surface_instance.destroy_surface(self.surface, None) };
-//    }
-//}
-
-pub struct Engine {
-    renderer: VulkanRenderer,
-    windows: HashMap<WindowId, RendererWindow>,
-    primary_window_id: WindowId,
-}
-
-impl Engine {
-    pub fn new(event_loop: &ActiveEventLoop) -> Result<Self> {
-        println!("Making Engine");
-        let primary_window = event_loop.create_window(Default::default())?;
-        let primary_window_id = primary_window.id();
-
-        primary_window.set_title("PvZ Rust");
-
-        let renderer = VulkanRenderer::new(&primary_window);
-
-        let raw_display_handle = primary_window.display_handle()?.as_raw();
-        let raw_window_handle = primary_window.window_handle()?.as_raw();
-
-        let surface = unsafe {
-            ash_window::create_surface(
-                &renderer.entry,
-                &renderer.instance,
-                raw_display_handle,
-                raw_window_handle,
-                None,
-            )?
-        };
-
-        let surface_instance = khr::surface::Instance::new(&renderer.entry, &renderer.instance);
-
-        let capabilities = unsafe {
-            surface_instance.get_physical_device_surface_capabilities(
-                renderer.physical_device.handle,
-                surface,
-            )?
-        };
-
-        let renderer_window = RendererWindow {
-            window: primary_window,
-            surface,
-            surface_instance,
-            capabilities,
-        };
-
-        let windows = HashMap::from([(primary_window_id, renderer_window)]);
-        Ok(Self {
-            renderer,
-            windows,
-            primary_window_id,
-        })
-    }
-
     pub fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -318,17 +340,18 @@ impl Engine {
     }
 }
 
-impl Drop for Engine {
-    fn drop(&mut self) {
-        for (window_id, renderer_window) in &mut self.windows {
-            unsafe {
-                renderer_window
-                    .surface_instance
-                    .destroy_surface(renderer_window.surface, None)
-            };
-        }
-    }
-}
+//impl Drop for Engine {
+//    fn drop(&mut self) {
+//        for (window_id, renderer_window) in &mut self.windows {
+//            unsafe {
+//                renderer_window
+//                    .surface_instance
+//                    .destroy_surface(renderer_window.surface, None)
+//            };
+//        }
+//        self.renderer.clean_up();
+//    }
+//}
 
 struct RendererSwapchain {
     swapchain_instance: khr::swapchain::Device,
@@ -336,13 +359,12 @@ struct RendererSwapchain {
     image_views: Vec<vk::ImageView>,
     format: vk::Format,
     extent: vk::Extent2D,
-    logical_device: Arc<LogicalDevice>,
 }
 
 impl RendererSwapchain {
     fn new(
         instance: &ash::Instance,
-        logical_device: LogicalDevice,
+        logical_device: &LogicalDevice,
         //physical_device: &PhysicalDevice,
         window: &RendererWindow,
     ) -> Result<Self> {
@@ -389,7 +411,7 @@ impl RendererSwapchain {
             let image_view_info = vk::ImageViewCreateInfo::default()
                 .image(image)
                 .view_type(vk::ImageViewType::TYPE_2D)
-                .format(vk::Format::B8G8R8A8_UNORM)
+                .format(format)
                 .subresource_range(subresource_range);
 
             let image_view = unsafe {
@@ -407,19 +429,12 @@ impl RendererSwapchain {
             image_views,
             format,
             extent,
-            logical_device: Arc::new(logical_device),
         })
     }
-}
 
-impl Drop for RendererSwapchain {
-    fn drop(&mut self) {
+    fn clean_up(&mut self, logical_device: &LogicalDevice) {
         for image_view in &self.image_views {
-            unsafe {
-                self.logical_device
-                    .handle
-                    .destroy_image_view(*image_view, None)
-            };
+            unsafe { logical_device.handle.destroy_image_view(*image_view, None) };
         }
         unsafe {
             self.swapchain_instance
@@ -431,15 +446,18 @@ impl Drop for RendererSwapchain {
 struct Shader {
     shader_module: vk::ShaderModule,
     stage: vk::ShaderStageFlags,
-    device: Arc<LogicalDevice>,
 }
 
 impl Shader {
-    fn new(device: LogicalDevice, code: &[u32], stage: vk::ShaderStageFlags) -> Result<Self> {
+    fn new(
+        logical_device: &LogicalDevice,
+        code: &[u32],
+        stage: vk::ShaderStageFlags,
+    ) -> Result<Self> {
         let shader_module_info = vk::ShaderModuleCreateInfo::default().code(code);
 
         let shader_module = unsafe {
-            device
+            logical_device
                 .handle
                 .create_shader_module(&shader_module_info, None)?
         };
@@ -447,19 +465,170 @@ impl Shader {
         Ok(Shader {
             shader_module,
             stage,
-            device: Arc::new(device),
         })
     }
-}
 
-impl Drop for Shader {
-    fn drop(&mut self) {
+    fn clean_up(&mut self, logical_device: &LogicalDevice) {
         unsafe {
-            self.device
+            logical_device
                 .handle
                 .destroy_shader_module(self.shader_module, None)
         };
     }
 }
 
-struct RendererPipeline {}
+//impl Drop for Shader {
+//    fn drop(&mut self) {
+//        unsafe {
+//            self.logical_device
+//                .handle
+//                .destroy_shader_module(self.shader_module, None)
+//        };
+//    }
+//}
+
+struct RendererPipeline {
+    pipeline_layout: PipelineLayout,
+    pipeline: vk::Pipeline,
+    swapchain: RendererSwapchain,
+}
+
+impl RendererPipeline {
+    fn new(
+        logical_device: &LogicalDevice,
+        window: &RendererWindow,
+        instance: &ash::Instance,
+    ) -> Result<Self> {
+        let mut swapchain = RendererSwapchain::new(instance, &logical_device, window)?;
+        println!("Making RendererPipeline");
+
+        let mut vertex_code = io::Cursor::new(std::fs::read("src/shaders/vert.spv")?);
+        let mut vert_shader = Shader::new(
+            &logical_device,
+            &*(ash::util::read_spv(&mut vertex_code)?),
+            vk::ShaderStageFlags::default(),
+        )?;
+
+        let mut frag_code = io::Cursor::new(std::fs::read("src/shaders/frag.spv")?);
+        let mut frag_shader = Shader::new(
+            &logical_device,
+            &*(ash::util::read_spv(&mut frag_code)?),
+            vk::ShaderStageFlags::default(),
+        )?;
+
+        let pipeline_layout = unsafe {
+            logical_device
+                .handle
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)?
+        };
+
+        let pipeline = Self::create_graphics_pipeline(
+            &logical_device,
+            &swapchain,
+            &vert_shader,
+            &frag_shader,
+            pipeline_layout,
+            Default::default(),
+        )?;
+
+        let renderer_pipeline = Self {
+            pipeline_layout,
+            pipeline,
+            swapchain,
+        };
+
+        vert_shader.clean_up(logical_device);
+        frag_shader.clean_up(logical_device);
+
+        Ok(renderer_pipeline)
+    }
+
+    fn create_graphics_pipeline(
+        logical_device: &LogicalDevice,
+        swapchain: &RendererSwapchain,
+        vert_shader: &Shader,
+        frag_shader: &Shader,
+        pipeline_layout: PipelineLayout,
+        pipeline_cache: vk::PipelineCache,
+    ) -> Result<vk::Pipeline> {
+        let entry_point = std::ffi::CString::new("main")?;
+
+        let graphics_pipeline = unsafe {
+            logical_device
+                .handle
+                .create_graphics_pipelines(
+                    pipeline_cache,
+                    &[vk::GraphicsPipelineCreateInfo::default()
+                        .stages(&[
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::VERTEX)
+                                .module(vert_shader.shader_module)
+                                .name(&entry_point),
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::FRAGMENT)
+                                .module(frag_shader.shader_module)
+                                .name(&entry_point),
+                        ])
+                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                        .input_assembly_state(
+                            &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+                        )
+                        .viewport_state(
+                            &vk::PipelineViewportStateCreateInfo::default()
+                                .viewports(&[vk::Viewport::default()
+                                    .width(swapchain.extent.width as f32)
+                                    .height(swapchain.extent.height as f32)
+                                    .max_depth(1.0)])
+                                .scissors(&[vk::Rect2D::default().extent(swapchain.extent)]),
+                        )
+                        .rasterization_state(
+                            &vk::PipelineRasterizationStateCreateInfo::default()
+                                .polygon_mode(vk::PolygonMode::FILL)
+                                .cull_mode(vk::CullModeFlags::NONE)
+                                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                                .line_width(1.0),
+                        )
+                        .multisample_state(
+                            &vk::PipelineMultisampleStateCreateInfo::default()
+                                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                        )
+                        .color_blend_state(
+                            &vk::PipelineColorBlendStateCreateInfo::default().attachments(&[
+                                vk::PipelineColorBlendAttachmentState::default()
+                                    .color_write_mask(vk::ColorComponentFlags::RGBA)
+                                    .blend_enable(false),
+                            ]),
+                        )
+                        .dynamic_state(
+                            &vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
+                                vk::DynamicState::VIEWPORT,
+                                vk::DynamicState::SCISSOR,
+                            ]),
+                        )
+                        .layout(pipeline_layout)
+                        .push_next(
+                            &mut vk::PipelineRenderingCreateInfo::default()
+                                .color_attachment_formats(&[swapchain.format]),
+                        )],
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+
+        Ok(graphics_pipeline)
+    }
+
+    fn clean_up(&mut self, logical_device: &LogicalDevice) {
+        unsafe {
+            logical_device.handle.destroy_pipeline(self.pipeline, None);
+            logical_device
+                .handle
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+        }
+        self.swapchain.clean_up(logical_device);
+    }
+}
