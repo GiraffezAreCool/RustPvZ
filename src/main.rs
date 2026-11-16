@@ -3,7 +3,8 @@ Hello it is GiraffezAreCool. This is my attempt to make PvZ in rust and Vulkan
 This is mt first time using rust and vulkan so please help
 Why am i doing this you may ask? cause i'd be fun idk.
 
-NO GEN AI
+NO GEN AI well i think i cant check all the code snippits i use for ai.
+
 uhhh yea
 */
 
@@ -27,8 +28,15 @@ impl ApplicationHandler for App {
         window_id: winit::window::WindowId,
         event: winit::event::WindowEvent,
     ) {
+        //println!("{:?}", event);
         if let Some(engine) = self.engine.as_mut() {
             engine.window_event(event_loop, window_id, event);
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.request_redraw();
         }
     }
 }

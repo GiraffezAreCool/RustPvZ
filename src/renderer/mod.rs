@@ -7,19 +7,20 @@ use anyhow::Result;
 use anyhow::bail;
 use ash::Entry;
 use ash::khr;
-use ash::khr::swapchain;
+use ash::sec;
 use ash::vk;
 use ash::vk::PipelineLayout;
 use std::collections::HashMap;
 use std::ffi;
 use std::io;
-use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::Window;
 use winit::window::WindowId;
+
+use crate::renderer;
 
 #[derive(Clone, Copy)]
 struct PhysicalDevice {
@@ -128,6 +129,13 @@ impl VulkanRenderer {
             self.logical_device.handle.destroy_device(None);
         }
         println!("Destroyed logical device");
+    }
+
+    fn resize(&mut self, window: &RendererWindow) -> Result<()> {
+        self.graphics_pipeline
+            .swapchain
+            .resize(&self.logical_device, window)?;
+        Ok(())
     }
 }
 
@@ -294,7 +302,22 @@ impl Engine {
                     self.windows.remove(&window_id);
                 }
             }
+            WindowEvent::RedrawRequested => {
+                self.renderer
+                    .graphics_pipeline
+                    .render(&self.renderer.logical_device, &self.windows[&window_id])
+                    .unwrap();
+            }
+            WindowEvent::Resized(_) => {
+                self.renderer.resize(&self.windows[&window_id]).unwrap();
+            }
             _ => {}
+        }
+    }
+
+    pub fn request_redraw(&self) {
+        for window in self.windows.values() {
+            window.window.request_redraw();
         }
     }
 
@@ -342,6 +365,13 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        unsafe {
+            self.renderer
+                .logical_device
+                .handle
+                .device_wait_idle()
+                .unwrap()
+        };
         self.renderer.clean_up();
         for (window_id, renderer_window) in &mut self.windows {
             unsafe {
@@ -360,8 +390,10 @@ struct RendererSwapchain {
     swapchain_instance: khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     image_views: Vec<vk::ImageView>,
+    images: Vec<vk::Image>,
     format: vk::Format,
     extent: vk::Extent2D,
+    image_count: u32,
 }
 
 impl RendererSwapchain {
@@ -376,15 +408,14 @@ impl RendererSwapchain {
         let extent = window.capabilities.current_extent;
 
         let swapchain_instance = khr::swapchain::Device::new(&instance, &logical_device.handle);
-
+        let image_count = 3
+            .max(window.capabilities.min_image_count)
+            .min(window.capabilities.max_image_count);
         let swapchain = unsafe {
             swapchain_instance.create_swapchain(
                 &vk::SwapchainCreateInfoKHR::default()
                     .surface(window.surface)
-                    .min_image_count(
-                        3.max(window.capabilities.min_image_count)
-                            .min(window.capabilities.max_image_count),
-                    )
+                    .min_image_count(image_count)
                     .image_format(format)
                     .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
                     .image_extent(extent)
@@ -430,9 +461,88 @@ impl RendererSwapchain {
             swapchain_instance,
             swapchain,
             image_views,
+            images: Default::default(),
             format,
             extent,
+            image_count,
         })
+    }
+
+    fn resize(&mut self, logical_device: &LogicalDevice, window: &RendererWindow) -> Result<()> {
+        let size = window.window.inner_size();
+
+        self.extent = vk::Extent2D {
+            width: size.width,
+            height: size.height,
+        };
+
+        if self.extent.width == 0 || self.extent.height == 0 {
+            return Ok(());
+        }
+
+        let new_swapchain = unsafe {
+            self.swapchain_instance.create_swapchain(
+                &vk::SwapchainCreateInfoKHR::default()
+                    .surface(window.surface)
+                    .min_image_count(
+                        3.max(window.capabilities.min_image_count)
+                            .min(window.capabilities.max_image_count),
+                    )
+                    .image_format(self.format)
+                    .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                    .image_extent(self.extent)
+                    .image_array_layers(1)
+                    .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                    .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+                    .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                    .present_mode(vk::PresentModeKHR::FIFO)
+                    .clipped(true)
+                    .old_swapchain(self.swapchain),
+                None,
+            )?
+        };
+
+        for image_view in self.image_views.drain(..) {
+            unsafe { logical_device.handle.destroy_image_view(image_view, None) };
+        }
+        self.images.clear();
+        unsafe {
+            self.swapchain_instance
+                .destroy_swapchain(self.swapchain, None)
+        };
+
+        self.swapchain = new_swapchain;
+
+        self.images = unsafe {
+            self.swapchain_instance
+                .get_swapchain_images(self.swapchain)?
+        };
+
+        for image in &self.images {
+            let subresource_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            let image_view_info = vk::ImageViewCreateInfo::default()
+                .image(*image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.format)
+                .subresource_range(subresource_range);
+
+            let image_view = unsafe {
+                logical_device
+                    .handle
+                    .create_image_view(&image_view_info, None)?
+            };
+
+            self.image_views.push(image_view);
+        }
+        println!("Done Resized");
+        Ok(())
     }
 
     fn clean_up(&mut self, logical_device: &LogicalDevice) {
@@ -506,6 +616,7 @@ struct RendererPipeline {
     swapchain: RendererSwapchain,
     command_pool: vk::CommandPool,
     frames: Vec<Frame>,
+    frame_index: usize,
 }
 
 impl RendererPipeline {
@@ -558,7 +669,7 @@ impl RendererPipeline {
             )?
         };
 
-        let command_buffer_count = 1;
+        let command_buffer_count = swapchain.image_count;
 
         let command_buffers = unsafe {
             logical_device.handle.allocate_command_buffers(
@@ -592,17 +703,169 @@ impl RendererPipeline {
                 });
             }
         }
-
         Ok(Self {
             pipeline_layout,
             pipeline,
             swapchain,
             command_pool,
             frames,
+            frame_index: 0,
         })
     }
 
-    fn render(&mut self) {}
+    fn increment_frame_index(&mut self) {
+        //self.frame_index = 0;
+        self.frame_index = (self.frame_index + 1) % self.swapchain.image_count as usize
+    }
+
+    fn render(&mut self, logical_device: &LogicalDevice, window: &RendererWindow) -> Result<()> {
+        //println!("Rendering...");
+        //println!("{}", self.frame_index);
+        self.increment_frame_index();
+        let frame = &self.frames[self.frame_index];
+
+        unsafe {
+            logical_device
+                .handle
+                .wait_for_fences(&[frame.fence], true, u64::MAX)?;
+
+            logical_device.handle.reset_fences(&[frame.fence])?;
+
+            let (image_index, is_suboptimal) =
+                self.swapchain.swapchain_instance.acquire_next_image(
+                    self.swapchain.swapchain,
+                    u64::MAX,
+                    frame.image_available_semaphore,
+                    vk::Fence::null(),
+                )?;
+
+            if is_suboptimal {
+                self.swapchain.resize(logical_device, window)?;
+            }
+
+            logical_device
+                .handle
+                .reset_command_buffer(frame.command_buffer, vk::CommandBufferResetFlags::empty())?;
+
+            logical_device.handle.begin_command_buffer(
+                frame.command_buffer,
+                &vk::CommandBufferBeginInfo::default(),
+            )?;
+
+            logical_device.handle.cmd_set_viewport(
+                frame.command_buffer,
+                0,
+                &[vk::Viewport::default()
+                    .width(self.swapchain.extent.width as f32)
+                    .height(self.swapchain.extent.height as f32)],
+            );
+
+            logical_device.handle.cmd_set_scissor(
+                frame.command_buffer,
+                0,
+                &[vk::Rect2D::default().extent(self.swapchain.extent)],
+            );
+
+            logical_device.handle.cmd_bind_pipeline(
+                frame.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
+            );
+
+            let subresource_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            //https://lowleveldive.com for dynamic rendering flow chart thingy
+
+            logical_device.handle.cmd_pipeline_barrier(
+                frame.command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::default(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.swapchain.images[image_index as usize])
+                    .subresource_range(subresource_range)],
+            );
+            logical_device.handle.cmd_begin_rendering(
+                frame.command_buffer,
+                &vk::RenderingInfo::default()
+                    .layer_count(1)
+                    .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                        .image_view(self.swapchain.image_views[image_index as usize])
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .clear_value(vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.0, 0.0, 0.0, 1.0],
+                            },
+                        })
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)])
+                    .render_area(vk::Rect2D::default().extent(self.swapchain.extent)),
+            );
+
+            logical_device
+                .handle
+                .cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+
+            logical_device
+                .handle
+                .cmd_end_rendering(frame.command_buffer);
+
+            logical_device.handle.cmd_pipeline_barrier(
+                frame.command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::default(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.swapchain.images[image_index as usize])
+                    .subresource_range(subresource_range)],
+            );
+
+            logical_device
+                .handle
+                .end_command_buffer(frame.command_buffer)?;
+
+            logical_device.handle.queue_submit(
+                logical_device.graphics_queue,
+                &[vk::SubmitInfo::default()
+                    .wait_semaphores(&[frame.image_available_semaphore])
+                    .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+                    .command_buffers(&[frame.command_buffer])
+                    .signal_semaphores(&[frame.render_finished_semaphore])],
+                frame.fence,
+            )?;
+
+            self.swapchain.swapchain_instance.queue_present(
+                logical_device.graphics_queue,
+                &vk::PresentInfoKHR::default()
+                    .wait_semaphores(&[frame.render_finished_semaphore])
+                    .swapchains(&[self.swapchain.swapchain])
+                    .image_indices(&[image_index]),
+            )?;
+        };
+
+        Ok(())
+    }
 
     fn create_graphics_pipeline(
         logical_device: &LogicalDevice,
