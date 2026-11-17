@@ -365,6 +365,7 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        println!("Dropping Engine");
         unsafe {
             self.renderer
                 .logical_device
@@ -408,9 +409,9 @@ impl RendererSwapchain {
         let extent = window.capabilities.current_extent;
 
         let swapchain_instance = khr::swapchain::Device::new(&instance, &logical_device.handle);
-        let image_count = 3
-            .max(window.capabilities.min_image_count)
-            .min(window.capabilities.max_image_count);
+        let image_count = 1
+            .max(window.capabilities.max_image_count)
+            .min(window.capabilities.min_image_count);
         let swapchain = unsafe {
             swapchain_instance.create_swapchain(
                 &vk::SwapchainCreateInfoKHR::default()
@@ -469,6 +470,7 @@ impl RendererSwapchain {
     }
 
     fn resize(&mut self, logical_device: &LogicalDevice, window: &RendererWindow) -> Result<()> {
+        unsafe { logical_device.handle.device_wait_idle().unwrap() };
         let size = window.window.inner_size();
 
         self.extent = vk::Extent2D {
@@ -480,14 +482,15 @@ impl RendererSwapchain {
             return Ok(());
         }
 
+        self.image_count = 1
+            .max(window.capabilities.max_image_count)
+            .min(window.capabilities.min_image_count);
+
         let new_swapchain = unsafe {
             self.swapchain_instance.create_swapchain(
                 &vk::SwapchainCreateInfoKHR::default()
                     .surface(window.surface)
-                    .min_image_count(
-                        3.max(window.capabilities.min_image_count)
-                            .min(window.capabilities.max_image_count),
-                    )
+                    .min_image_count(self.image_count)
                     .image_format(self.format)
                     .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
                     .image_extent(self.extent)
@@ -719,7 +722,7 @@ impl RendererPipeline {
     }
 
     fn render(&mut self, logical_device: &LogicalDevice, window: &RendererWindow) -> Result<()> {
-        //println!("Rendering...");
+        println!("Rendering...");
         //println!("{}", self.frame_index);
         self.increment_frame_index();
         let frame = &self.frames[self.frame_index];
@@ -731,6 +734,8 @@ impl RendererPipeline {
 
             logical_device.handle.reset_fences(&[frame.fence])?;
 
+            //println!("{:?}", logical_device.handle.get_fence_status(frame.fence));
+
             let (image_index, is_suboptimal) =
                 self.swapchain.swapchain_instance.acquire_next_image(
                     self.swapchain.swapchain,
@@ -740,7 +745,7 @@ impl RendererPipeline {
                 )?;
 
             if is_suboptimal {
-                self.swapchain.resize(logical_device, window)?;
+                self.swapchain.resize(logical_device, window).unwrap();
             }
 
             logical_device
@@ -798,6 +803,7 @@ impl RendererPipeline {
                     .image(self.swapchain.images[image_index as usize])
                     .subresource_range(subresource_range)],
             );
+
             logical_device.handle.cmd_begin_rendering(
                 frame.command_buffer,
                 &vk::RenderingInfo::default()
@@ -845,15 +851,18 @@ impl RendererPipeline {
                 .handle
                 .end_command_buffer(frame.command_buffer)?;
 
-            logical_device.handle.queue_submit(
-                logical_device.graphics_queue,
-                &[vk::SubmitInfo::default()
-                    .wait_semaphores(&[frame.image_available_semaphore])
-                    .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
-                    .command_buffers(&[frame.command_buffer])
-                    .signal_semaphores(&[frame.render_finished_semaphore])],
-                frame.fence,
-            )?;
+            logical_device
+                .handle
+                .queue_submit(
+                    logical_device.graphics_queue,
+                    &[vk::SubmitInfo::default()
+                        .wait_semaphores(&[frame.image_available_semaphore])
+                        .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+                        .command_buffers(&[frame.command_buffer])
+                        .signal_semaphores(&[frame.render_finished_semaphore])],
+                    frame.fence,
+                )
+                .unwrap();
 
             self.swapchain.swapchain_instance.queue_present(
                 logical_device.graphics_queue,
