@@ -1,7 +1,10 @@
 /*
 in what order am i supposed to destroy stuff??????
 */
-
+mod shaders;
+use crate::renderer::shaders::Shader;
+use crate::renderer::shaders::Vertex;
+use crate::renderer::shaders::VertexBuffer;
 use anyhow::Ok;
 use anyhow::Result;
 use anyhow::bail;
@@ -51,7 +54,8 @@ impl VulkanRenderer {
     ) -> Self {
         println!("Making VulkanRenderer");
         let logical_device = Self::create_logical_device(&instance, physical_device).unwrap();
-        let graphics_pipeline = RendererPipeline::new(&logical_device, &window, &instance).unwrap();
+        let graphics_pipeline =
+            RendererPipeline::new(&logical_device, &physical_device, &window, &instance).unwrap();
         Self {
             entry,
             instance,
@@ -389,7 +393,7 @@ impl Drop for Engine {
 
 struct RendererSwapchain {
     swapchain_instance: khr::swapchain::Device,
-    swapchain: vk::SwapchainKHR,
+    handle: vk::SwapchainKHR,
     image_views: Vec<vk::ImageView>,
     images: Vec<vk::Image>,
     format: vk::Format,
@@ -460,7 +464,7 @@ impl RendererSwapchain {
 
         Ok(Self {
             swapchain_instance,
-            swapchain,
+            handle: swapchain,
             image_views,
             images: Default::default(),
             format,
@@ -501,7 +505,7 @@ impl RendererSwapchain {
                     .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                     .present_mode(vk::PresentModeKHR::FIFO)
                     .clipped(true)
-                    .old_swapchain(self.swapchain),
+                    .old_swapchain(self.handle),
                 None,
             )?
         };
@@ -510,17 +514,11 @@ impl RendererSwapchain {
             unsafe { logical_device.handle.destroy_image_view(image_view, None) };
         }
         self.images.clear();
-        unsafe {
-            self.swapchain_instance
-                .destroy_swapchain(self.swapchain, None)
-        };
+        unsafe { self.swapchain_instance.destroy_swapchain(self.handle, None) };
 
-        self.swapchain = new_swapchain;
+        self.handle = new_swapchain;
 
-        self.images = unsafe {
-            self.swapchain_instance
-                .get_swapchain_images(self.swapchain)?
-        };
+        self.images = unsafe { self.swapchain_instance.get_swapchain_images(self.handle)? };
 
         for image in &self.images {
             let subresource_range = vk::ImageSubresourceRange::default()
@@ -553,46 +551,8 @@ impl RendererSwapchain {
             unsafe { logical_device.handle.destroy_image_view(*image_view, None) };
         }
         println!("Destroyed image views");
-        unsafe {
-            self.swapchain_instance
-                .destroy_swapchain(self.swapchain, None)
-        };
+        unsafe { self.swapchain_instance.destroy_swapchain(self.handle, None) };
         println!("Destroyed swapchain");
-    }
-}
-
-struct Shader {
-    shader_module: vk::ShaderModule,
-    stage: vk::ShaderStageFlags,
-}
-
-impl Shader {
-    fn new(
-        logical_device: &LogicalDevice,
-        code: &[u32],
-        stage: vk::ShaderStageFlags,
-    ) -> Result<Self> {
-        let shader_module_info = vk::ShaderModuleCreateInfo::default().code(code);
-
-        let shader_module = unsafe {
-            logical_device
-                .handle
-                .create_shader_module(&shader_module_info, None)?
-        };
-
-        Ok(Shader {
-            shader_module,
-            stage,
-        })
-    }
-
-    fn clean_up(&mut self, logical_device: &LogicalDevice) {
-        unsafe {
-            logical_device
-                .handle
-                .destroy_shader_module(self.shader_module, None)
-        };
-        println!("Destroyed shader module");
     }
 }
 
@@ -620,17 +580,22 @@ struct RendererPipeline {
     command_pool: vk::CommandPool,
     frames: Vec<Frame>,
     frame_index: usize,
+    vertex_buffer: VertexBuffer,
 }
 
 impl RendererPipeline {
     fn new(
         logical_device: &LogicalDevice,
+        physical_device: &PhysicalDevice,
         window: &RendererWindow,
         instance: &ash::Instance,
     ) -> Result<Self> {
         let swapchain = RendererSwapchain::new(instance, &logical_device, window)?;
         println!("Making RendererPipeline");
 
+        let vertex_buffer = VertexBuffer::new(logical_device, instance, physical_device)?;
+
+        //glslc ./src/shaders/shader.vert -o ./src/shaders/vert.spv
         let mut vertex_code = io::Cursor::new(std::fs::read("src/shaders/vert.spv")?);
         let mut vert_shader = Shader::new(
             &logical_device,
@@ -713,6 +678,7 @@ impl RendererPipeline {
             command_pool,
             frames,
             frame_index: 0,
+            vertex_buffer,
         })
     }
 
@@ -722,7 +688,7 @@ impl RendererPipeline {
     }
 
     fn render(&mut self, logical_device: &LogicalDevice, window: &RendererWindow) -> Result<()> {
-        println!("Rendering...");
+        //println!("Rendering...");
         //println!("{}", self.frame_index);
         self.increment_frame_index();
         let frame = &self.frames[self.frame_index];
@@ -738,7 +704,7 @@ impl RendererPipeline {
 
             let (image_index, is_suboptimal) =
                 self.swapchain.swapchain_instance.acquire_next_image(
-                    self.swapchain.swapchain,
+                    self.swapchain.handle,
                     u64::MAX,
                     frame.image_available_semaphore,
                     vk::Fence::null(),
@@ -763,6 +729,13 @@ impl RendererPipeline {
                 &[vk::Viewport::default()
                     .width(self.swapchain.extent.width as f32)
                     .height(self.swapchain.extent.height as f32)],
+            );
+
+            logical_device.handle.cmd_bind_vertex_buffers(
+                frame.command_buffer,
+                0,
+                &[self.vertex_buffer.handle],
+                &[0_u64],
             );
 
             logical_device.handle.cmd_set_scissor(
@@ -821,9 +794,13 @@ impl RendererPipeline {
                     .render_area(vk::Rect2D::default().extent(self.swapchain.extent)),
             );
 
-            logical_device
-                .handle
-                .cmd_draw(frame.command_buffer, 3, 1, 0, 0);
+            logical_device.handle.cmd_draw(
+                frame.command_buffer,
+                self.vertex_buffer.vertex_length,
+                1,
+                0,
+                0,
+            );
 
             logical_device
                 .handle
@@ -868,7 +845,7 @@ impl RendererPipeline {
                 logical_device.graphics_queue,
                 &vk::PresentInfoKHR::default()
                     .wait_semaphores(&[frame.render_finished_semaphore])
-                    .swapchains(&[self.swapchain.swapchain])
+                    .swapchains(&[self.swapchain.handle])
                     .image_indices(&[image_index]),
             )?;
         };
@@ -886,6 +863,9 @@ impl RendererPipeline {
     ) -> Result<vk::Pipeline> {
         let entry_point = std::ffi::CString::new("main")?;
 
+        let binding_description = Vertex::get_binding_descriptions();
+        let attribute_description = Vertex::get_attribute_descriptions();
+
         let graphics_pipeline = unsafe {
             logical_device
                 .handle
@@ -902,9 +882,15 @@ impl RendererPipeline {
                                 .module(frag_shader.shader_module)
                                 .name(&entry_point),
                         ])
-                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                        .vertex_input_state(
+                            &&vk::PipelineVertexInputStateCreateInfo::default()
+                                .flags(vk::PipelineVertexInputStateCreateFlags::empty())
+                                .vertex_attribute_descriptions(&attribute_description)
+                                .vertex_binding_descriptions(&binding_description),
+                        )
                         .input_assembly_state(
                             &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .flags(vk::PipelineInputAssemblyStateCreateFlags::empty())
                                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
                         )
                         .viewport_state(
@@ -981,6 +967,7 @@ impl RendererPipeline {
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             println!("Destroyed pipeline layout");
         }
+        self.vertex_buffer.clean_up(logical_device);
         self.swapchain.clean_up(logical_device);
     }
 }
