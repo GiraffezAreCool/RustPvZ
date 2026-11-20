@@ -2,6 +2,7 @@
 in what order am i supposed to destroy stuff??????
 */
 mod shaders;
+use crate::renderer::shaders::IndexBuffer;
 use crate::renderer::shaders::Shader;
 use crate::renderer::shaders::Vertex;
 use crate::renderer::shaders::VertexBuffer;
@@ -35,6 +36,8 @@ struct LogicalDevice {
     handle: ash::Device,
     graphics_queue: vk::Queue,
     graphics_queue_idx: u32,
+    transfer_queue: vk::Queue,
+    transfer_queue_idx: u32,
 }
 
 struct VulkanRenderer {
@@ -72,7 +75,8 @@ impl VulkanRenderer {
         let queue_family_prop =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device.handle) };
 
-        let mut idx = None;
+        let mut graphics_idx = None;
+        let mut transfer_idx = None;
 
         for (i, queue_family) in queue_family_prop.iter().enumerate() {
             if queue_family.queue_count <= 0 {
@@ -80,13 +84,19 @@ impl VulkanRenderer {
             }
 
             if queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                idx = Some(i as u32);
-                break;
+                graphics_idx = Some(i as u32);
+            }
+            if queue_family.queue_flags.contains(vk::QueueFlags::TRANSFER) {
+                transfer_idx = Some(i as u32);
             }
         }
 
-        let graphics_queue_idx = match idx {
+        let graphics_queue_idx = match graphics_idx {
             None => bail!("No graphics queue found"),
+            Some(i) => i,
+        };
+        let transfer_queue_idx = match transfer_idx {
+            None => bail!("No transfer queue found"),
             Some(i) => i,
         };
 
@@ -109,21 +119,20 @@ impl VulkanRenderer {
                     .push_next(
                         &mut vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
                             .buffer_device_address(true),
-                    )
-                    .push_next(
-                        &mut vk::PhysicalDeviceDynamicRenderingLocalReadFeaturesKHR::default()
-                            .dynamic_rendering_local_read(true),
                     ),
                 None,
             )?
         };
 
         let graphics_queue = unsafe { handle.get_device_queue(graphics_queue_idx, 0) };
+        let transfer_queue = unsafe { handle.get_device_queue(transfer_queue_idx, 0) };
 
         Ok(LogicalDevice {
             handle,
             graphics_queue,
             graphics_queue_idx,
+            transfer_queue,
+            transfer_queue_idx,
         })
     }
 
@@ -542,7 +551,7 @@ impl RendererSwapchain {
 
             self.image_views.push(image_view);
         }
-        println!("Done Resized");
+        //println!("Done Resized");
         Ok(())
     }
 
@@ -581,6 +590,7 @@ struct RendererPipeline {
     frames: Vec<Frame>,
     frame_index: usize,
     vertex_buffer: VertexBuffer,
+    index_buffer: IndexBuffer,
 }
 
 impl RendererPipeline {
@@ -594,6 +604,7 @@ impl RendererPipeline {
         println!("Making RendererPipeline");
 
         let vertex_buffer = VertexBuffer::new(logical_device, instance, physical_device)?;
+        let index_buffer = IndexBuffer::new(logical_device, instance, physical_device)?;
 
         //glslc ./src/shaders/shader.vert -o ./src/shaders/vert.spv
         let mut vertex_code = io::Cursor::new(std::fs::read("src/shaders/vert.spv")?);
@@ -679,6 +690,7 @@ impl RendererPipeline {
             frames,
             frame_index: 0,
             vertex_buffer,
+            index_buffer,
         })
     }
 
@@ -738,10 +750,31 @@ impl RendererPipeline {
                 &[0_u64],
             );
 
+            logical_device.handle.cmd_bind_index_buffer(
+                frame.command_buffer,
+                self.index_buffer.handle,
+                0,
+                vk::IndexType::UINT32,
+            );
+
             logical_device.handle.cmd_set_scissor(
                 frame.command_buffer,
                 0,
                 &[vk::Rect2D::default().extent(self.swapchain.extent)],
+            );
+
+            logical_device.handle.cmd_copy_buffer(
+                frame.command_buffer,
+                self.vertex_buffer.staging_buffer.handle,
+                self.vertex_buffer.handle,
+                &[vk::BufferCopy::default().size(self.vertex_buffer.buffer_size)],
+            );
+
+            logical_device.handle.cmd_copy_buffer(
+                frame.command_buffer,
+                self.index_buffer.staging_buffer.handle,
+                self.index_buffer.handle,
+                &[vk::BufferCopy::default().size(self.index_buffer.buffer_size)],
             );
 
             logical_device.handle.cmd_bind_pipeline(
@@ -794,10 +827,11 @@ impl RendererPipeline {
                     .render_area(vk::Rect2D::default().extent(self.swapchain.extent)),
             );
 
-            logical_device.handle.cmd_draw(
+            logical_device.handle.cmd_draw_indexed(
                 frame.command_buffer,
-                self.vertex_buffer.vertex_length,
+                self.index_buffer.index_length,
                 1,
+                0,
                 0,
                 0,
             );
@@ -967,6 +1001,7 @@ impl RendererPipeline {
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             println!("Destroyed pipeline layout");
         }
+        self.index_buffer.clean_up(logical_device);
         self.vertex_buffer.clean_up(logical_device);
         self.swapchain.clean_up(logical_device);
     }
